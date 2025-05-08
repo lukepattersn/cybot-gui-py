@@ -1,3 +1,23 @@
+def move_backward(self, distance_cm):
+        # Calculate new position based on current angle, but in reverse
+        theta = math.radians(self.cybot_position['angle'])
+        dx = -distance_cm * math.sin(theta)  # Negative for backward movement
+        dy = -distance_cm * math.cos(theta)  # Negative for backward movement
+        
+        # Update position
+        self.cybot_position['x'] += dx
+        self.cybot_position['y'] += dy
+        
+        # Add to movement history
+        self.movement_history.append(dict(self.cybot_position))
+        
+        # Update map
+        self.update_map()
+        
+        # Update position display
+        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
+        
+        self.log(f"Moved backward {distance_cm} cm")
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import socket
@@ -240,6 +260,14 @@ class CybotControlApp:
         self.status_label = ttk.Label(connection_frame, text="Disconnected", foreground="red")
         self.status_label.pack(side=tk.LEFT, padx=10, pady=5)
         
+        # Position display
+        position_label = ttk.Label(connection_frame, text="Position:")
+        position_label.pack(side=tk.LEFT, padx=(20, 5), pady=5)
+        
+        self.position_var = tk.StringVar(value="(0.0, 0.0, 90°)")
+        position_display = ttk.Label(connection_frame, textvariable=self.position_var)
+        position_display.pack(side=tk.LEFT, padx=5, pady=5)
+        
         # Middle section: split between controls and visualization
         middle_frame = ttk.Frame(main_frame)
         middle_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -309,6 +337,7 @@ class CybotControlApp:
         self.map_ax.set_ylabel("Y Position (cm)")
         self.map_ax.set_title("CyBot Map")
         self.map_ax.grid(True)
+        self.map_ax.set_aspect('equal')  # Set aspect ratio to equal for correct proportions
         self.map_canvas = FigureCanvasTkAgg(self.map_fig, map_frame)
         self.map_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.update_map()
@@ -468,16 +497,23 @@ class CybotControlApp:
             distance_mm = self.extract_number(line, r"Moving forward (\d+) mm")
             if distance_mm is not None:
                 self.move_forward(distance_mm / 10)  # Convert mm to cm
+                self.log(f"Position updated: Forward {distance_mm/10} cm")
         
         elif "Turning right" in line:
             angle = self.extract_number(line, r"Turning right (\d+) degrees")
             if angle is not None:
                 self.turn_right(angle)
+                self.log(f"Position updated: Right {angle} degrees")
         
         elif "Turning left" in line:
             angle = self.extract_number(line, r"Turning left (\d+) degrees")
             if angle is not None:
                 self.turn_left(angle)
+                self.log(f"Position updated: Left {angle} degrees")
+        
+        # Check for movement complete confirmation
+        elif "Movement complete" in line:
+            self.log("Movement sequence completed", "green")
         
         # Check for scan start
         elif "Beginning IR environment scan" in line:
@@ -504,6 +540,23 @@ class CybotControlApp:
         elif "|" in line and re.search(r'\d+\s*\|\s*\d+\.\d+\s*\|\s*\d+\.\d+\s*\|\s*\d+\.\d+', line):
             self.process_object_data(line)
         
+        # Quick commands confirmation
+        elif "Quick turn right" in line:
+            self.turn_right(45)  # The quick turn command is 45 degrees
+            self.log("Position updated: Quick right turn 45 degrees")
+        
+        elif "Quick turn left" in line:
+            self.turn_left(45)  # The quick turn command is 45 degrees
+            self.log("Position updated: Quick left turn 45 degrees")
+        
+        elif "Quick move forward" in line:
+            self.move_forward(10)  # The quick move is 10cm
+            self.log("Position updated: Quick forward 10 cm")
+        
+        elif "Quick move backward" in line:
+            self.move_backward(10)  # The quick move backward is 10cm
+            self.log("Position updated: Quick backward 10 cm")
+        
         # Check for blue sample detection
         elif "blue sample detected" in line:
             self.log("Blue water sample detected!")
@@ -520,42 +573,36 @@ class CybotControlApp:
             return
         
         # Debug the line format
-        self.log(f"Parsing scan line: '{line}'")
+        if self.debug_mode:
+            self.log(f"Parsing scan line: '{line}'")
         
-        # Parse scan data line - handle both formats
-        # IR format has: angle, distance, IR raw
-        # PING format has: angle, distance
-        parts = line.strip().split()
+        # Parse scan data line - directly extract numbers
+        # Format for IR scan: "  0     2.50    1024"
+        # Format for PING scan: "  0     2.50"
+        numbers = re.findall(r"[\d.]+", line)
         
-        if len(parts) >= 2:  # At least angle and distance
+        if len(numbers) >= 2:  # At least angle and distance
             try:
-                angle = float(parts[0])
-                distance = float(parts[1])
+                angle = float(numbers[0])
+                distance = float(numbers[1])
                 
-                # Log the parsed values
-                self.log(f"Parsed scan data: angle={angle}, distance={distance}")
+                # Only log in debug mode to avoid spam
+                if self.debug_mode:
+                    self.log(f"Parsed scan data: angle={angle}, distance={distance}")
                 
                 # Only store valid data points
                 if 0 <= angle <= 180 and distance > 0:
                     self.scan_data['angles'].append(angle)
-                    self.scan_data['distances'].append(distance)
+                    self.scan_data['distances'].append(min(distance, 250))  # Cap at 250cm for display
+                    
+                    # Check the angle to provide feedback on progress
+                    if angle % 45 == 0:
+                        self.log(f"Scan progress: {angle}° processed")
             except Exception as e:
                 self.log(f"Error parsing scan data: {str(e)}")
-                # Try to recover what we can
-                try:
-                    # Look for numbers in the line
-                    numbers = re.findall(r"[\d.]+", line)
-                    if len(numbers) >= 2:
-                        angle = float(numbers[0])
-                        distance = float(numbers[1])
-                        
-                        # Only store valid data points
-                        if 0 <= angle <= 180 and distance > 0:
-                            self.scan_data['angles'].append(angle)
-                            self.scan_data['distances'].append(distance)
-                            self.log(f"Recovered scan data: angle={angle}, distance={distance}")
-                except:
-                    pass  # If recovery fails, just skip this line
+        else:
+            if self.debug_mode:
+                self.log(f"Not enough values in scan line: {len(numbers)} values found")
     
     def process_object_data(self, line):
         # Debug the raw object data line
@@ -674,6 +721,13 @@ class CybotControlApp:
         self.log(f"{scan_type} scan visualization complete.")
     
     def update_polar_plot(self):
+        if not self.scan_data['angles'] or not self.scan_data['distances']:
+            self.log("Warning: No scan data to update polar plot")
+            return
+            
+        # Debug log
+        self.log(f"Updating polar plot with {len(self.scan_data['angles'])} data points")
+        
         # Convert angles to radians for polar plot
         # CyBot uses 0° = right, 90° = forward, 180° = left
         # which matches our polar plot configuration
@@ -690,21 +744,32 @@ class CybotControlApp:
         self.polar_ax.set_rticks([0.5, 1, 1.5, 2, 2.5])
         self.polar_ax.set_rmax(2.5)
         
-        # Plot scan data
-        color = 'red' if self.scan_data['type'] == 'IR' else 'blue'
-        self.polar_ax.plot(angles_rad, self.scan_data['distances'], color=color, linewidth=2)
+        # Sort data points by angle to ensure proper line connection
+        sorted_data = sorted(zip(angles_rad, self.scan_data['distances']))
+        if sorted_data:
+            sorted_angles, sorted_distances = zip(*sorted_data)
+            
+            # Plot scan data
+            color = 'red' if self.scan_data['type'] == 'IR' else 'blue'
+            self.polar_ax.plot(sorted_angles, sorted_distances, color=color, linewidth=2)
+            
+            # Add scatter points for better visibility
+            self.polar_ax.scatter(sorted_angles, sorted_distances, color=color, s=10)
         
         # Set title
-        self.polar_ax.set_title(f"CyBot {self.scan_data['type']} Scan (0°-180°)")
+        scan_type = self.scan_data['type'] or "Unknown"
+        self.polar_ax.set_title(f"CyBot {scan_type} Scan (0°-180°)")
         
         # Redraw canvas
         self.polar_canvas.draw()
+        
+        self.log(f"Polar plot updated with {len(angles_rad)} data points")
     
     def update_map(self):
         # Clear previous plot
         self.map_ax.clear()
         
-        # Set up map
+        # Set up map with equal aspect ratio
         self.map_ax.set_xlim(-250, 250)
         self.map_ax.set_ylim(-250, 250)
         self.map_ax.set_xlabel("X Position (cm)")
@@ -712,10 +777,16 @@ class CybotControlApp:
         self.map_ax.set_title("CyBot Map")
         self.map_ax.grid(True)
         
+        # Set aspect ratio to equal for correct proportions
+        self.map_ax.set_aspect('equal')
+        
         # Plot movement history
         x_history = [pos['x'] for pos in self.movement_history]
         y_history = [pos['y'] for pos in self.movement_history]
         self.map_ax.plot(x_history, y_history, 'k-', linewidth=1)
+        
+        # Add markers for each position in movement history
+        self.map_ax.plot(x_history, y_history, 'k.', markersize=3)
         
         # Plot objects
         for obj in self.objects:
@@ -732,13 +803,13 @@ class CybotControlApp:
         
         # Plot water samples
         for sample in self.water_samples:
-            self.map_ax.plot(sample['x'], sample['y'], 'bo', markersize=10)
+            circle = plt.Circle((sample['x'], sample['y']), 15, color='blue', alpha=0.5)
+            self.map_ax.add_patch(circle)
             self.map_ax.annotate("WATER", 
                                (sample['x'], sample['y']), 
                                fontsize=8, 
                                ha='center', va='center', 
-                               xytext=(0, 10), 
-                               textcoords='offset points')
+                               color='white')
         
         # Plot CyBot position and direction
         # Draw CyBot as a triangle pointing in the current direction
@@ -761,6 +832,18 @@ class CybotControlApp:
         
         self.map_ax.fill([x1, x2, x3], [y1, y2, y3], 'green', alpha=0.7)
         
+        # Add axes origin lines
+        self.map_ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        self.map_ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
+        
+        # Add current position text
+        self.map_ax.annotate(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)", 
+                           (self.cybot_position['x'], self.cybot_position['y']),
+                           xytext=(10, -15),
+                           textcoords='offset points',
+                           fontsize=8,
+                           color='green')
+        
         # Redraw canvas
         self.map_canvas.draw()
     
@@ -779,6 +862,10 @@ class CybotControlApp:
         
         # Update map
         self.update_map()
+        
+        # Update position display
+        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
+        
         self.log(f"Moved forward {distance_cm} cm")
     
     def turn_right(self, angle):
@@ -793,6 +880,10 @@ class CybotControlApp:
         
         # Update map
         self.update_map()
+        
+        # Update position display
+        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
+        
         self.log(f"Turned right {angle} degrees")
     
     def turn_left(self, angle):
@@ -807,6 +898,10 @@ class CybotControlApp:
         
         # Update map
         self.update_map()
+        
+        # Update position display
+        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
+        
         self.log(f"Turned left {angle} degrees")
     
     def extract_number(self, text, pattern):
