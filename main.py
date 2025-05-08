@@ -1,1004 +1,434 @@
-def move_backward(self, distance_cm):
-        # Calculate new position based on current angle, but in reverse
-        theta = math.radians(self.cybot_position['angle'])
-        dx = -distance_cm * math.sin(theta)  # Negative for backward movement
-        dy = -distance_cm * math.cos(theta)  # Negative for backward movement
-        
-        # Update position
-        self.cybot_position['x'] += dx
-        self.cybot_position['y'] += dy
-        
-        # Add to movement history
-        self.movement_history.append(dict(self.cybot_position))
-        
-        # Update map
-        self.update_map()
-        
-        # Update position display
-        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
-        
-        self.log(f"Moved backward {distance_cm} cm")
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
 import socket
-import threading
 import time
-import math
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+from matplotlib.patches import Circle, Wedge
+import math
 import re
-import random
+import threading
+import sys
+import os
+import platform
 
-class CybotControlApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("CyBot Control Interface")
-        self.root.geometry("1200x800")
-        self.root.resizable(True, True)
-        
-        # Socket variables
+class CyBotMapper:
+    def __init__(self, host="192.168.1.1", port=288):
+        # Connection settings
+        self.host = host
+        self.port = port
         self.socket = None
-        self.connected = False
-        self.receive_thread = None
-        self.stop_thread = False
+        self.buffer = ""
+        self.lock = threading.Lock()
         
-        # Data storage
-        self.scan_data = {'angles': [], 'distances': [], 'type': None}
-        self.cybot_position = {'x': 0, 'y': 0, 'angle': 90}  # Starting position, facing up (90°)
-        self.movement_history = [{'x': 0, 'y': 0, 'angle': 90}]  # Start with initial position
-        self.objects = []
-        self.water_samples = []
+        # CyBot state
+        self.position = [0, 0]  # [x, y] in cm
+        self.orientation = 90   # Degrees (0 = right, 90 = up)
+        self.objects = []       # List of detected objects
         
-        # Debug mode - enables extra debug output
-        self.debug_mode = True
+        # Map settings
+        self.fig, self.ax = plt.subplots(figsize=(10, 10))
+        self.max_range = 250    # cm - maximum display range
+        self.scan_data = []     # Raw scan data points
+        self.object_patches = []  # Store object visualization elements
         
-        # Create UI elements
-        self.create_menu()
-        self.create_main_frame()
+        # Initialize plot elements
+        self.setup_map()
         
-        # Log toggle state
-        self.show_log = True
+    def setup_map(self):
+        """Initialize the map visualization"""
+        # Set up a square map with proper scaling
+        self.ax.set_xlim(-self.max_range, self.max_range)
+        self.ax.set_ylim(-self.max_range, self.max_range)
+        self.ax.set_aspect('equal')
+        self.ax.grid(True)
+        self.ax.set_title('CyBot Mapping')
+        self.ax.set_xlabel('X (cm)')
+        self.ax.set_ylabel('Y (cm)')
         
-        # Initial log
-        self.log("CyBot Control Interface started. Ready to connect to CyBot at 192.168.1.1:288")
+        # Add the CyBot as a marker at the origin
+        self.cybot_marker = Circle((0, 0), 10, color='blue', fill=True, zorder=5)
+        self.ax.add_patch(self.cybot_marker)
         
-    def create_menu(self):
-        menu_bar = tk.Menu(self.root)
+        # Add direction indicator
+        angle_rad = math.radians(self.orientation)
+        dir_x = 20 * math.cos(angle_rad)
+        dir_y = 20 * math.sin(angle_rad)
+        self.direction_line, = self.ax.plot([0, dir_x], [0, dir_y], 'b-', linewidth=2, zorder=5)
         
-        # File menu
-        file_menu = tk.Menu(menu_bar, tearoff=0)
-        file_menu.add_command(label="Exit", command=self.on_closing)
-        menu_bar.add_cascade(label="File", menu=file_menu)
+        # Initialize the path visualization
+        self.path_x = [0]
+        self.path_y = [0]
+        self.path_line, = self.ax.plot(self.path_x, self.path_y, 'g-', linewidth=1, zorder=2)
         
-        # View menu
-        view_menu = tk.Menu(menu_bar, tearoff=0)
+        # Initialize the scan data visualization
+        self.scan_points = self.ax.scatter([], [], color='red', s=10, zorder=3)
         
-        # Use a variable to track the state
-        self.show_log_var = tk.BooleanVar(value=True)
-        view_menu.add_checkbutton(label="Show Log", command=self.toggle_log, 
-                                 variable=self.show_log_var)
+        # Add a legend
+        self.ax.plot([], [], 'b-', label='CyBot')
+        self.ax.plot([], [], 'g-', label='Path')
+        self.ax.plot([], [], 'ro', markersize=4, label='Scan Points')
+        self.ax.plot([], [], 'orange', marker='o', linestyle='none', markersize=8, label='Objects')
+        self.ax.legend(loc='upper right')
         
-        # Debug mode toggle
-        self.debug_mode_var = tk.BooleanVar(value=True)
-        view_menu.add_checkbutton(label="Debug Mode", command=self.toggle_debug,
-                                 variable=self.debug_mode_var)
+        plt.tight_layout()
         
-        menu_bar.add_cascade(label="View", menu=view_menu)
-        
-        # Testing menu
-        test_menu = tk.Menu(menu_bar, tearoff=0)
-        test_menu.add_command(label="Test IR Scan", command=self.test_ir_scan)
-        test_menu.add_command(label="Test PING Scan", command=self.test_ping_scan)
-        test_menu.add_command(label="Test Object Detection", command=self.test_object_detection)
-        test_menu.add_separator()
-        test_menu.add_command(label="Clear Map", command=self.clear_map)
-        menu_bar.add_cascade(label="Testing", menu=test_menu)
-        
-        self.root.config(menu=menu_bar)
-    
-    def toggle_debug(self):
-        self.debug_mode = self.debug_mode_var.get()
-        self.log(f"Debug mode {'enabled' if self.debug_mode else 'disabled'}")
-    
-    def test_ir_scan(self):
-        """Simulate an IR scan for testing visualization"""
-        self.log("Simulating IR scan...")
-        
-        # Create some sample data
-        angles = list(range(0, 181, 4))  # 0 to 180 in steps of 4
-        distances = []
-        
-        # Generate some realistic-looking data
-        for angle in angles:
-            # Base distance with some randomness
-            base_distance = 2.0
-            
-            # Add "objects" at specific angles
-            if 30 <= angle <= 50:
-                base_distance = 1.0  # Object at 30-50 degrees
-            elif 90 <= angle <= 110:
-                base_distance = 0.5  # Object at 90-110 degrees
-            elif 150 <= angle <= 170:
-                base_distance = 1.5  # Object at 150-170 degrees
-                
-            # Add some noise
-            noise = (random.random() - 0.5) * 0.2
-            distance = max(0.1, base_distance + noise)
-            distances.append(distance)
-        
-        # Set as scan data
-        self.scan_data = {
-            'angles': angles,
-            'distances': distances,
-            'type': 'IR'
-        }
-        
-        # Update visualization
-        self.update_polar_plot()
-        
-        # Clear scan data type
-        self.scan_data['type'] = None
-        
-        self.log("IR scan simulation complete")
-    
-    def test_ping_scan(self):
-        """Simulate a PING scan for testing visualization"""
-        self.log("Simulating PING scan...")
-        
-        # Create some sample data
-        angles = list(range(0, 181, 4))  # 0 to 180 in steps of 4
-        distances = []
-        
-        # Generate some realistic-looking data
-        for angle in angles:
-            # Base distance with some randomness
-            base_distance = 2.0
-            
-            # Add "objects" at specific angles
-            if 20 <= angle <= 40:
-                base_distance = 0.8  # Object at 20-40 degrees
-            elif 80 <= angle <= 100:
-                base_distance = 0.7  # Object at 80-100 degrees
-            elif 140 <= angle <= 160:
-                base_distance = 1.2  # Object at 140-160 degrees
-                
-            # Add some noise
-            noise = (random.random() - 0.5) * 0.1
-            distance = max(0.1, base_distance + noise)
-            distances.append(distance)
-        
-        # Set as scan data
-        self.scan_data = {
-            'angles': angles,
-            'distances': distances,
-            'type': 'PING'
-        }
-        
-        # Update visualization
-        self.update_polar_plot()
-        
-        # Clear scan data type
-        self.scan_data['type'] = None
-        
-        self.log("PING scan simulation complete")
-    
-    def test_object_detection(self):
-        """Simulate object detection for testing map visualization"""
-        self.log("Simulating object detection...")
-        
-        # Define some test objects
-        test_objects = [
-            {'id': 1, 'angle': 30, 'distance': 50, 'width': 25, 'type': 'IR'},
-            {'id': 2, 'angle': 90, 'distance': 40, 'width': 20, 'type': 'IR'},
-            {'id': 3, 'angle': 150, 'distance': 60, 'width': 30, 'type': 'IR'},
-        ]
-        
-        # Add objects to the map
-        for obj in test_objects:
-            theta = math.radians(obj['angle'])
-            
-            # Calculate object position
-            rel_x = obj['distance'] * math.sin(theta)
-            rel_y = obj['distance'] * math.cos(theta)
-            
-            # Transform by CyBot's position and orientation
-            cybot_theta = math.radians(self.cybot_position['angle'])
-            rotated_x = rel_x * math.cos(cybot_theta) - rel_y * math.sin(cybot_theta)
-            rotated_y = rel_x * math.sin(cybot_theta) + rel_y * math.cos(cybot_theta)
-            
-            abs_x = self.cybot_position['x'] + rotated_x
-            abs_y = self.cybot_position['y'] + rotated_y
-            
-            # Add to objects list
-            self.objects.append({
-                'id': obj['id'],
-                'x': abs_x,
-                'y': abs_y,
-                'angle': obj['angle'],
-                'distance': obj['distance'],
-                'width': obj['width'],
-                'type': obj['type']
-            })
-        
-        # Update map
-        self.update_map()
-        self.log(f"Added {len(test_objects)} test objects to the map")
-    
-    def clear_map(self):
-        """Clear all objects and reset the map"""
-        self.log("Clearing map...")
-        
-        # Reset objects and water samples
-        self.objects = []
-        self.water_samples = []
-        
-        # Reset position to start position (but keep movement history)
-        self.cybot_position = {'x': 0, 'y': 0, 'angle': 90}
-        
-        # Reset movement history
-        self.movement_history = [{'x': 0, 'y': 0, 'angle': 90}]
-        
-        # Update map
-        self.update_map()
-        self.log("Map cleared")
-    
-    def create_main_frame(self):
-        # Main container with padding
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Top section: Connection
-        connection_frame = ttk.LabelFrame(main_frame, text="Connection")
-        connection_frame.pack(fill=tk.X, pady=5)
-        
-        # Simplified connection controls with hardcoded IP and port
-        self.connect_button = ttk.Button(connection_frame, text="Connect to 192.168.1.1:288", command=self.toggle_connection)
-        self.connect_button.pack(side=tk.LEFT, padx=10, pady=5)
-        
-        self.status_label = ttk.Label(connection_frame, text="Disconnected", foreground="red")
-        self.status_label.pack(side=tk.LEFT, padx=10, pady=5)
-        
-        # Position display
-        position_label = ttk.Label(connection_frame, text="Position:")
-        position_label.pack(side=tk.LEFT, padx=(20, 5), pady=5)
-        
-        self.position_var = tk.StringVar(value="(0.0, 0.0, 90°)")
-        position_display = ttk.Label(connection_frame, textvariable=self.position_var)
-        position_display.pack(side=tk.LEFT, padx=5, pady=5)
-        
-        # Middle section: split between controls and visualization
-        middle_frame = ttk.Frame(main_frame)
-        middle_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Left side: Control buttons
-        left_frame = ttk.LabelFrame(middle_frame, text="Controls")
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 5))
-        
-        # Control buttons
-        buttons = [
-            ("IR Scan", "i", 0, 0),
-            ("PING Scan", "p", 0, 1),
-            ("Move", "m", 1, 0),
-            ("Check Blue Sample", "b", 1, 1),
-            ("Turn Right 45°", "r", 2, 0),
-            ("Turn Left 45°", "l", 2, 1),
-            ("Forward 10cm", "f", 3, 0),
-            ("Backward 10cm", "v", 3, 1),
-            ("Sample Collection", "s", 4, 0),
-            ("Help", "h", 4, 1)
-        ]
-        
-        for text, cmd, row, col in buttons:
-            btn = ttk.Button(left_frame, text=text, width=15,
-                           command=lambda c=cmd: self.send_command(c))
-            btn.grid(row=row, column=col, padx=5, pady=5, sticky="ew")
-        
-        # Right side: Visualization (Polar Plot and Map)
-        right_frame = ttk.Frame(middle_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        
-        # Create visualization frames
-        viz_frame = ttk.Frame(right_frame)
-        viz_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Polar Plot frame (top)
-        polar_frame = ttk.LabelFrame(viz_frame, text="Sensor Scan")
-        polar_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        
-        # Create polar plot (half circle for 0-180 degrees)
-        self.polar_fig = Figure(figsize=(6, 3), dpi=100)
-        self.polar_ax = self.polar_fig.add_subplot(111, projection='polar')
-        
-        # Configure for half circle (0-180 degrees)
-        self.polar_ax.set_thetamin(0)
-        self.polar_ax.set_thetamax(180)
-        
-        # 0 degrees at right, 90 at top, 180 at left
-        self.polar_ax.set_theta_zero_location("E")
-        self.polar_ax.set_rlabel_position(-22.5)
-        self.polar_ax.set_rticks([0.5, 1, 1.5, 2, 2.5])
-        self.polar_ax.set_rmax(2.5)
-        self.polar_ax.set_title("CyBot Sensor Scan (0°-180°)")
-        self.polar_canvas = FigureCanvasTkAgg(self.polar_fig, polar_frame)
-        self.polar_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Map frame (bottom)
-        map_frame = ttk.LabelFrame(viz_frame, text="Navigation Map")
-        map_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
-        
-        # Create map plot
-        self.map_fig = Figure(figsize=(6, 4), dpi=100)
-        self.map_ax = self.map_fig.add_subplot(111)
-        self.map_ax.set_xlim(-250, 250)
-        self.map_ax.set_ylim(-250, 250)
-        self.map_ax.set_xlabel("X Position (cm)")
-        self.map_ax.set_ylabel("Y Position (cm)")
-        self.map_ax.set_title("CyBot Map")
-        self.map_ax.grid(True)
-        self.map_ax.set_aspect('equal')  # Set aspect ratio to equal for correct proportions
-        self.map_canvas = FigureCanvasTkAgg(self.map_fig, map_frame)
-        self.map_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.update_map()
-        
-        # Bottom section: Log
-        self.log_frame = ttk.LabelFrame(main_frame, text="Log")
-        self.log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        self.log_text = scrolledtext.ScrolledText(self.log_frame, height=10)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_text.config(state=tk.DISABLED)
-        
-        # Handle window close
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-    
-    def toggle_log(self):
-        self.show_log = not self.show_log
-        if self.show_log:
-            self.log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        else:
-            self.log_frame.pack_forget()
-    
-    def toggle_connection(self):
-        if not self.connected:
-            self.connect()
-        else:
-            self.disconnect()
-    
     def connect(self):
+        """Connect to the CyBot server"""
         try:
-            # Hardcoded IP and port
-            ip = "192.168.1.1"
-            port = 288
-            
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(3)  # 3 second timeout for connection
-            self.socket.connect((ip, port))
-            self.socket.settimeout(None)  # Remove timeout for normal operation
-            
-            self.connected = True
-            self.connect_button.config(text="Disconnect")
-            self.status_label.config(text="Connected", foreground="green")
-            
-            # Start receive thread
-            self.stop_thread = False
-            self.receive_thread = threading.Thread(target=self.receive_data)
-            self.receive_thread.daemon = True
-            self.receive_thread.start()
-            
-            self.log("Connected to CyBot at {}:{}".format(ip, port))
+            self.socket.connect((self.host, self.port))
+            print(f"Connected to CyBot at {self.host}:{self.port}")
+            return True
         except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed to connect: {str(e)}")
-            self.log(f"Connection error: {str(e)}")
+            print(f"Failed to connect: {e}")
+            self.socket = None
+            return False
     
-    def disconnect(self):
-        if self.socket:
-            try:
-                self.stop_thread = True
-                time.sleep(0.5)  # Give receive thread time to exit
-                self.socket.close()
-            except:
-                pass
-            finally:
-                self.socket = None
-        
-        self.connected = False
-        self.connect_button.config(text="Connect to 192.168.1.1:288")
-        self.status_label.config(text="Disconnected", foreground="red")
-        self.log("Disconnected from CyBot")
-    
-    def send_command(self, cmd):
-        if not self.connected:
-            messagebox.showinfo("Not Connected", "Please connect to CyBot first")
-            return
+    def send_command(self, command):
+        """Send a command to the CyBot"""
+        if not self.socket:
+            print("Not connected to CyBot")
+            return False
         
         try:
-            # Some commands need special handling
-            if cmd == 'm':
-                # For move command, we need to get turn angle and distance
-                angle_dialog = MovementDialog(self.root, "Enter turn angle (+ right, - left)")
-                if angle_dialog.result is not None:
-                    turn_angle = angle_dialog.result
-                    
-                    distance_dialog = MovementDialog(self.root, "Enter distance (cm)")
-                    if distance_dialog.result is not None:
-                        distance_cm = distance_dialog.result
-                        
-                        # Send the 'm' command
-                        self.socket.send(f"{cmd}\n".encode())
-                        self.log(f"Sent: {cmd}")
-                        
-                        # Wait for the prompt for turn angle
-                        time.sleep(0.5)
-                        
-                        # Send turn angle
-                        self.socket.send(f"{turn_angle}\n".encode())
-                        self.log(f"Sent turn angle: {turn_angle}")
-                        
-                        # Wait for the prompt for distance
-                        time.sleep(0.5)
-                        
-                        # Send distance
-                        self.socket.send(f"{distance_cm}\n".encode())
-                        self.log(f"Sent distance: {distance_cm}")
-                        
-                        # The movement will be processed in the receive_data method
-                        # when confirmation is received
-            else:
-                # Simple command, just send it
-                self.socket.send(f"{cmd}\n".encode())
-                self.log(f"Sent: {cmd}")
+            self.socket.send((command + '\n').encode())
+            print(f"Sent command: {command}")
+            return True
         except Exception as e:
-            messagebox.showerror("Send Error", f"Failed to send command: {str(e)}")
-            self.log(f"Send error: {str(e)}")
+            print(f"Error sending command: {e}")
+            return False
     
-    def receive_data(self):
-        buffer = ""
-        
-        while not self.stop_thread:
-            try:
-                data = self.socket.recv(1024).decode()
-                if not data:
-                    break
-                
-                # Log raw data for debugging
-                self.log(f"Raw data received: {repr(data)}", "gray")
-                
-                # Add to buffer and process lines
-                buffer += data
-                lines = buffer.split('\n')
-                
-                # Keep the last incomplete line in the buffer
-                buffer = lines.pop() if lines else ""
-                
-                for line in lines:
-                    if line.strip():  # Skip empty lines
-                        self.process_line(line)
-            except Exception as e:
-                if not self.stop_thread:  # Only log if not stopping intentionally
-                    self.log(f"Receive error: {str(e)}")
-                    break
-        
-        if not self.stop_thread:  # Only disconnect if not stopping intentionally
-            self.root.after(0, self.disconnect)  # Disconnect in main thread
-    
-    def process_line(self, line):
-        # Log the received line
-        self.log(f"Received: {line}", "blue")
-        
-        # Check for scan data - need to handle both IR and PING scan formats
-        if self.scan_data['type'] is not None:
-            # Try to parse scan data line
-            self.process_scan_data(line)
-        
-        # Check for movement confirmation
-        elif "Moving forward" in line:
-            distance_mm = self.extract_number(line, r"Moving forward (\d+) mm")
-            if distance_mm is not None:
-                self.move_forward(distance_mm / 10)  # Convert mm to cm
-                self.log(f"Position updated: Forward {distance_mm/10} cm")
-        
-        elif "Turning right" in line:
-            angle = self.extract_number(line, r"Turning right (\d+) degrees")
-            if angle is not None:
-                self.turn_right(angle)
-                self.log(f"Position updated: Right {angle} degrees")
-        
-        elif "Turning left" in line:
-            angle = self.extract_number(line, r"Turning left (\d+) degrees")
-            if angle is not None:
-                self.turn_left(angle)
-                self.log(f"Position updated: Left {angle} degrees")
-        
-        # Check for movement complete confirmation
-        elif "Movement complete" in line:
-            self.log("Movement sequence completed", "green")
-        
-        # Check for scan start
-        elif "Beginning IR environment scan" in line:
-            self.scan_data = {'angles': [], 'distances': [], 'type': 'IR'}
-            self.log("Starting IR scan data collection")
-        
-        elif "Beginning PING environment scan" in line:
-            self.scan_data = {'angles': [], 'distances': [], 'type': 'PING'}
-            self.log("Starting PING scan data collection")
-        
-        # Check for scan completion
-        elif "IR scan complete" in line or "PING scan complete" in line:
-            self.log(f"{self.scan_data['type']} scan complete. Processing data...")
-            self.complete_scan()
-        
-        # Look for object detection results lines
-        elif "Object Detection Results" in line:
-            self.log("Processing object detection results...")
-            # Reset object list when new detection starts
-            if "IR Object Detection Results" in line:
-                self.objects = []  # Reset only when IR detection starts
-        
-        # Process object data lines like: "  1 |   45.0 |   35.20 |   15.30"
-        elif "|" in line and re.search(r'\d+\s*\|\s*\d+\.\d+\s*\|\s*\d+\.\d+\s*\|\s*\d+\.\d+', line):
-            self.process_object_data(line)
-        
-        # Quick commands confirmation
-        elif "Quick turn right" in line:
-            self.turn_right(45)  # The quick turn command is 45 degrees
-            self.log("Position updated: Quick right turn 45 degrees")
-        
-        elif "Quick turn left" in line:
-            self.turn_left(45)  # The quick turn command is 45 degrees
-            self.log("Position updated: Quick left turn 45 degrees")
-        
-        elif "Quick move forward" in line:
-            self.move_forward(10)  # The quick move is 10cm
-            self.log("Position updated: Quick forward 10 cm")
-        
-        elif "Quick move backward" in line:
-            self.move_backward(10)  # The quick move backward is 10cm
-            self.log("Position updated: Quick backward 10 cm")
-        
-        # Check for blue sample detection
-        elif "blue sample detected" in line:
-            self.log("Blue water sample detected!")
-            # Add water sample at current position
-            self.water_samples.append({
-                'x': self.cybot_position['x'],
-                'y': self.cybot_position['y']
-            })
-            self.update_map()
-    
-    def process_scan_data(self, line):
-        # Skip header lines and empty lines
-        if "Angle" in line or "Distance" in line or "---" in line or not line.strip():
-            return
-        
-        # Debug the line format
-        if self.debug_mode:
-            self.log(f"Parsing scan line: '{line}'")
-        
-        # Parse scan data line - directly extract numbers
-        # Format for IR scan: "  0     2.50    1024"
-        # Format for PING scan: "  0     2.50"
-        numbers = re.findall(r"[\d.]+", line)
-        
-        if len(numbers) >= 2:  # At least angle and distance
-            try:
-                angle = float(numbers[0])
-                distance = float(numbers[1])
-                
-                # Only log in debug mode to avoid spam
-                if self.debug_mode:
-                    self.log(f"Parsed scan data: angle={angle}, distance={distance}")
-                
-                # Only store valid data points
-                if 0 <= angle <= 180 and distance > 0:
-                    self.scan_data['angles'].append(angle)
-                    self.scan_data['distances'].append(min(distance, 250))  # Cap at 250cm for display
-                    
-                    # Check the angle to provide feedback on progress
-                    if angle % 45 == 0:
-                        self.log(f"Scan progress: {angle}° processed")
-            except Exception as e:
-                self.log(f"Error parsing scan data: {str(e)}")
-        else:
-            if self.debug_mode:
-                self.log(f"Not enough values in scan line: {len(numbers)} values found")
-    
-    def process_object_data(self, line):
-        # Debug the raw object data line
-        self.log(f"Processing object data: '{line}'")
+    def receive_data(self, timeout=0.5):
+        """Receive and process incoming data"""
+        if not self.socket:
+            return ""
         
         try:
-            # Parse the object data line format: "  1 |   45.0 |   35.20 |   15.30"
-            # Split by | and extract numbers
-            parts = line.split('|')
-            if len(parts) < 4:
-                return  # Not enough parts
+            self.socket.settimeout(timeout)
+            data = self.socket.recv(1024).decode('utf-8', errors='replace')
+            return data
+        except socket.timeout:
+            return ""
+        except Exception as e:
+            print(f"Error receiving data: {e}")
+            return ""
+    
+    def update_position(self, movement_type, value):
+        """Update the CyBot's position based on confirmed movement"""
+        with self.lock:
+            if movement_type == "forward":
+                # Convert to cm and calculate new position based on orientation
+                distance = value / 10.0  # Value is in mm, convert to cm
+                rad_angle = math.radians(self.orientation)  # Use orientation directly
+                dx = distance * math.cos(rad_angle)
+                dy = distance * math.sin(rad_angle)
+                self.position[0] += dx
+                self.position[1] += dy
                 
-            obj_id = int(parts[0].strip())
-            center_angle = float(parts[1].strip())
-            distance = float(parts[2].strip())
-            width = float(parts[3].strip())
+                # Update path
+                self.path_x.append(self.position[0])
+                self.path_y.append(self.position[1])
+                
+            elif movement_type == "backward":
+                # Same as forward but negative
+                distance = -value / 10.0
+                rad_angle = math.radians(self.orientation)  # Use orientation directly
+                dx = distance * math.cos(rad_angle)
+                dy = distance * math.sin(rad_angle)
+                self.position[0] += dx
+                self.position[1] += dy
+                
+                # Update path
+                self.path_x.append(self.position[0])
+                self.path_y.append(self.position[1])
+                
+            elif movement_type == "turn_right":
+                self.orientation = (self.orientation - value) % 360
+                
+            elif movement_type == "turn_left":
+                self.orientation = (self.orientation + value) % 360
+
+    def parse_scan_data(self, data, scan_type="ir"):
+        """Parse scan results from the CyBot response"""
+        scan_points = []
+        
+        if scan_type == "ir":
+            # Match lines with angle, distance, IR reading
+            pattern = r"(\d+)\s+(\d+\.\d+)\s+(\d+)"
+        else:  # ping
+            # Match lines with angle, distance
+            pattern = r"(\d+)\s+(\d+\.\d+)"
             
-            # Log the extracted object properties
-            self.log(f"Object {obj_id}: angle={center_angle}, distance={distance}, width={width}")
+        matches = re.findall(pattern, data)
+        
+        for match in matches:
+            angle = float(match[0])
+            distance = float(match[1])
             
-            # Convert angle and distance to x,y coordinates relative to CyBot
-            # Note: CyBot uses 0° = right, 90° = forward, 180° = left
-            theta = math.radians(center_angle)
+            if distance > 0 and distance < self.max_range:
+                # Convert to global coordinates
+                # Adjust angle: 0° is front, increases clockwise
+                global_angle = (self.orientation + angle - 90) % 360
+                rad_angle = math.radians(global_angle)
+                
+                # Calculate global position
+                x = self.position[0] + distance * math.cos(rad_angle)
+                y = self.position[1] + distance * math.sin(rad_angle)
+                scan_points.append((x, y, angle, distance))
+        
+        return scan_points
+    
+    def parse_objects(self, data):
+        """Parse object detection results"""
+        objects = []
+        
+        # Look for object details in the format: ID | Center | Distance | Width
+        pattern = r"(\d+) \| +(\d+\.\d+) \| +(\d+\.\d+) \| +(\d+\.\d+)"
+        matches = re.findall(pattern, data)
+        
+        for match in matches:
+            obj_id = int(match[0])
+            center_angle = float(match[1])
+            distance = float(match[2])
+            width = float(match[3])
             
-            # Calculate object position (relative to current CyBot position)
-            # Sin for X because 90° is forward, Cos for Y because 0° is right
-            rel_x = distance * math.sin(theta)
-            rel_y = distance * math.cos(theta)
+            # Convert to global coordinates
+            global_angle = (self.orientation + center_angle - 90) % 360
+            rad_angle = math.radians(global_angle)
             
-            # Transform by CyBot's current position and orientation
-            cybot_theta = math.radians(self.cybot_position['angle'])
-            rotated_x = rel_x * math.cos(cybot_theta) - rel_y * math.sin(cybot_theta)
-            rotated_y = rel_x * math.sin(cybot_theta) + rel_y * math.cos(cybot_theta)
+            x = self.position[0] + distance * math.cos(rad_angle)
+            y = self.position[1] + distance * math.sin(rad_angle)
             
-            abs_x = self.cybot_position['x'] + rotated_x
-            abs_y = self.cybot_position['y'] + rotated_y
-            
-            # Add to objects list
-            self.objects.append({
+            objects.append({
                 'id': obj_id,
-                'x': abs_x,
-                'y': abs_y,
-                'angle': center_angle,
+                'x': x, 
+                'y': y,
+                'center_angle': center_angle,
+                'global_angle': global_angle,
                 'distance': distance,
-                'width': width,
-                'type': self.scan_data['type'] or 'Unknown'  # IR or PING
+                'width': width
             })
             
-            # Update map after adding an object
-            self.update_map()
-            
-            # Log the added object
-            self.log(f"Added object at map position: x={abs_x:.1f}, y={abs_y:.1f}")
-            
-        except Exception as e:
-            self.log(f"Error processing object data: {str(e)}")
-            # Try a more forgiving approach
-            try:
-                # Find all numbers in the line
-                numbers = re.findall(r"[\d.]+", line)
-                if len(numbers) >= 4:
-                    obj_id = int(float(numbers[0]))
-                    center_angle = float(numbers[1])
-                    distance = float(numbers[2])
-                    width = float(numbers[3])
-                    
-                    # Log recovery attempt
-                    self.log(f"Recovered object data: id={obj_id}, angle={center_angle}, distance={distance}, width={width}")
-                    
-                    # Rest of the code as above...
-                    theta = math.radians(center_angle)
-                    rel_x = distance * math.sin(theta)
-                    rel_y = distance * math.cos(theta)
-                    
-                    cybot_theta = math.radians(self.cybot_position['angle'])
-                    rotated_x = rel_x * math.cos(cybot_theta) - rel_y * math.sin(cybot_theta)
-                    rotated_y = rel_x * math.sin(cybot_theta) + rel_y * math.cos(cybot_theta)
-                    
-                    abs_x = self.cybot_position['x'] + rotated_x
-                    abs_y = self.cybot_position['y'] + rotated_y
-                    
-                    self.objects.append({
-                        'id': obj_id,
-                        'x': abs_x,
-                        'y': abs_y,
-                        'angle': center_angle,
-                        'distance': distance,
-                        'width': width,
-                        'type': self.scan_data['type'] or 'Unknown'
-                    })
-                    
-                    self.update_map()
-                    self.log(f"Added recovered object at map position: x={abs_x:.1f}, y={abs_y:.1f}")
-            except Exception as inner_e:
-                self.log(f"Failed to recover object data: {str(inner_e)}")
-    
-    def complete_scan(self):
-        if not self.scan_data['angles'] or not self.scan_data['distances']:
-            self.log("Warning: No scan data to process")
-            self.scan_data = {'angles': [], 'distances': [], 'type': None}
-            return
-        
-        # Log the collected data for debugging
-        self.log(f"Scan complete. Collected {len(self.scan_data['angles'])} data points.")
-        self.log(f"Angle range: {min(self.scan_data['angles'])}-{max(self.scan_data['angles'])}")
-        self.log(f"Distance range: {min(self.scan_data['distances']):.2f}-{max(self.scan_data['distances']):.2f}")
-        
-        # Update polar plot with the scan data
-        self.update_polar_plot()
-        
-        # Clear scan data type to stop collecting
-        scan_type = self.scan_data['type']
-        self.scan_data = {'angles': [], 'distances': [], 'type': None}
-        
-        # Log completion
-        self.log(f"{scan_type} scan visualization complete.")
-    
-    def update_polar_plot(self):
-        if not self.scan_data['angles'] or not self.scan_data['distances']:
-            self.log("Warning: No scan data to update polar plot")
-            return
-            
-        # Debug log
-        self.log(f"Updating polar plot with {len(self.scan_data['angles'])} data points")
-        
-        # Convert angles to radians for polar plot
-        # CyBot uses 0° = right, 90° = forward, 180° = left
-        # which matches our polar plot configuration
-        angles_rad = [math.radians(angle) for angle in self.scan_data['angles']]
-        
-        # Clear previous plot
-        self.polar_ax.clear()
-        
-        # Set up polar plot (half circle for 0-180 degrees)
-        self.polar_ax.set_thetamin(0)
-        self.polar_ax.set_thetamax(180)
-        self.polar_ax.set_theta_zero_location("E")  # 0 at right
-        self.polar_ax.set_rlabel_position(-22.5)
-        self.polar_ax.set_rticks([0.5, 1, 1.5, 2, 2.5])
-        self.polar_ax.set_rmax(2.5)
-        
-        # Sort data points by angle to ensure proper line connection
-        sorted_data = sorted(zip(angles_rad, self.scan_data['distances']))
-        if sorted_data:
-            sorted_angles, sorted_distances = zip(*sorted_data)
-            
-            # Plot scan data
-            color = 'red' if self.scan_data['type'] == 'IR' else 'blue'
-            self.polar_ax.plot(sorted_angles, sorted_distances, color=color, linewidth=2)
-            
-            # Add scatter points for better visibility
-            self.polar_ax.scatter(sorted_angles, sorted_distances, color=color, s=10)
-        
-        # Set title
-        scan_type = self.scan_data['type'] or "Unknown"
-        self.polar_ax.set_title(f"CyBot {scan_type} Scan (0°-180°)")
-        
-        # Redraw canvas
-        self.polar_canvas.draw()
-        
-        self.log(f"Polar plot updated with {len(angles_rad)} data points")
+        return objects
     
     def update_map(self):
-        # Clear previous plot
-        self.map_ax.clear()
-        
-        # Set up map with equal aspect ratio
-        self.map_ax.set_xlim(-250, 250)
-        self.map_ax.set_ylim(-250, 250)
-        self.map_ax.set_xlabel("X Position (cm)")
-        self.map_ax.set_ylabel("Y Position (cm)")
-        self.map_ax.set_title("CyBot Map")
-        self.map_ax.grid(True)
-        
-        # Set aspect ratio to equal for correct proportions
-        self.map_ax.set_aspect('equal')
-        
-        # Plot movement history
-        x_history = [pos['x'] for pos in self.movement_history]
-        y_history = [pos['y'] for pos in self.movement_history]
-        self.map_ax.plot(x_history, y_history, 'k-', linewidth=1)
-        
-        # Add markers for each position in movement history
-        self.map_ax.plot(x_history, y_history, 'k.', markersize=3)
-        
-        # Plot objects
-        for obj in self.objects:
-            color = 'red' if obj['type'] == 'IR' else 'blue'
-            circle = plt.Circle((obj['x'], obj['y']), obj['width']/2, 
-                               color=color, alpha=0.5)
-            self.map_ax.add_patch(circle)
+        """Update the map visualization with current state"""
+        with self.lock:
+            # Update CyBot position and orientation
+            self.cybot_marker.center = self.position
             
-            # Add width label
-            self.map_ax.annotate(f"{obj['width']:.1f}cm", 
-                               (obj['x'], obj['y']), 
-                               fontsize=8, 
-                               ha='center', va='center')
-        
-        # Plot water samples
-        for sample in self.water_samples:
-            circle = plt.Circle((sample['x'], sample['y']), 15, color='blue', alpha=0.5)
-            self.map_ax.add_patch(circle)
-            self.map_ax.annotate("WATER", 
-                               (sample['x'], sample['y']), 
-                               fontsize=8, 
-                               ha='center', va='center', 
-                               color='white')
-        
-        # Plot CyBot position and direction
-        # Draw CyBot as a triangle pointing in the current direction
-        bot_size = 20  # Size of triangle
-        
-        # Calculate triangle points based on position and angle
-        theta = math.radians(self.cybot_position['angle'])
-        x1 = self.cybot_position['x'] + bot_size * math.sin(theta)
-        y1 = self.cybot_position['y'] + bot_size * math.cos(theta)
-        
-        # Create points 60 degrees to either side for the back corners
-        theta_left = theta + math.radians(150)
-        theta_right = theta - math.radians(150)
-        
-        x2 = self.cybot_position['x'] + bot_size * math.sin(theta_left)
-        y2 = self.cybot_position['y'] + bot_size * math.cos(theta_left)
-        
-        x3 = self.cybot_position['x'] + bot_size * math.sin(theta_right)
-        y3 = self.cybot_position['y'] + bot_size * math.cos(theta_right)
-        
-        self.map_ax.fill([x1, x2, x3], [y1, y2, y3], 'green', alpha=0.7)
-        
-        # Add axes origin lines
-        self.map_ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-        self.map_ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
-        
-        # Add current position text
-        self.map_ax.annotate(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)", 
-                           (self.cybot_position['x'], self.cybot_position['y']),
-                           xytext=(10, -15),
-                           textcoords='offset points',
-                           fontsize=8,
-                           color='green')
-        
-        # Redraw canvas
-        self.map_canvas.draw()
+            # Update direction indicator
+            angle_rad = math.radians(self.orientation)
+            dir_x = self.position[0] + 20 * math.cos(angle_rad)
+            dir_y = self.position[1] + 20 * math.sin(angle_rad)
+            self.direction_line.set_data([self.position[0], dir_x], [self.position[1], dir_y])
+            
+            # Update path line
+            self.path_line.set_data(self.path_x, self.path_y)
+            
+            # Update scan points
+            if self.scan_data:
+                x_points = [point[0] for point in self.scan_data]
+                y_points = [point[1] for point in self.scan_data]
+                self.scan_points.set_offsets(np.column_stack([x_points, y_points]))
+            
+            # Clear previous object patches
+            for patch in self.object_patches:
+                patch.remove()
+            self.object_patches = []
+            
+            # Add new object patches
+            for obj in self.objects:
+                # Draw object as a circle with size based on width
+                radius = obj['width'] / 2
+                circle = Circle((obj['x'], obj['y']), radius, 
+                               color='orange', alpha=0.7, zorder=4)
+                self.ax.add_patch(circle)
+                
+                # Add text label for object ID
+                text = self.ax.text(obj['x'], obj['y'], str(obj['id']), 
+                                  fontsize=8, ha='center', va='center', 
+                                  color='black', zorder=6)
+                
+                self.object_patches.append(circle)
+                self.object_patches.append(text)
     
-    def move_forward(self, distance_cm):
-        # Calculate new position based on current angle
-        theta = math.radians(self.cybot_position['angle'])
-        dx = distance_cm * math.sin(theta)
-        dy = distance_cm * math.cos(theta)
+    def process_response(self, response):
+        """Process a response from the CyBot"""
+        if not response:
+            return False
         
-        # Update position
-        self.cybot_position['x'] += dx
-        self.cybot_position['y'] += dy
+        changes = False
         
-        # Add to movement history
-        self.movement_history.append(dict(self.cybot_position))
+        # Buffer the response for complete message processing
+        self.buffer += response
         
-        # Update map
-        self.update_map()
+        # Look for complete movement confirmations
+        if "complete" in self.buffer:
+            # Quick turn right
+            if "Quick turn right" in self.buffer and "complete" in self.buffer:
+                match = re.search(r"Quick turn right (\d+) degrees", self.buffer)
+                if match:
+                    angle = int(match.group(1))
+                    self.update_position("turn_right", angle)
+                    changes = True
+                    print(f"► Confirmed turn right {angle}°")
+            
+            # Quick turn left
+            elif "Quick turn left" in self.buffer and "complete" in self.buffer:
+                match = re.search(r"Quick turn left (\d+) degrees", self.buffer)
+                if match:
+                    angle = int(match.group(1))
+                    self.update_position("turn_left", angle)
+                    changes = True
+                    print(f"◄ Confirmed turn left {angle}°")
+            
+            # Quick move forward
+            elif "Quick move forward" in self.buffer and "complete" in self.buffer:
+                match = re.search(r"Quick move forward (\d+)cm", self.buffer)
+                if match:
+                    distance = int(match.group(1)) * 10  # Convert to mm
+                    self.update_position("forward", distance)
+                    changes = True
+                    print(f"▲ Confirmed forward {distance/10}cm")
+            
+            # Quick move backward
+            elif "Quick move backward" in self.buffer and "complete" in self.buffer:
+                match = re.search(r"Quick move backward (\d+)cm", self.buffer)
+                if match:
+                    distance = int(match.group(1)) * 10  # Convert to mm
+                    self.update_position("backward", distance)
+                    changes = True
+                    print(f"▼ Confirmed backward {distance/10}cm")
+            
+            # Standard movements from "m" command
+            elif "Moving forward" in self.buffer and "Movement complete" in self.buffer:
+                match = re.search(r"Moving forward (\d+) mm", self.buffer)
+                if match:
+                    distance = int(match.group(1))
+                    self.update_position("forward", distance)
+                    changes = True
+                    print(f"▲ Confirmed forward {distance/10}cm")
+            
+            elif "Turning right" in self.buffer and "Movement complete" in self.buffer:
+                match = re.search(r"Turning right (\d+) degrees", self.buffer)
+                if match:
+                    angle = int(match.group(1))
+                    self.update_position("turn_right", angle)
+                    changes = True
+                    print(f"► Confirmed turn right {angle}°")
+            
+            elif "Turning left" in self.buffer and "Movement complete" in self.buffer:
+                match = re.search(r"Turning left (\d+) degrees", self.buffer)
+                if match:
+                    angle = int(match.group(1))
+                    self.update_position("turn_left", angle)
+                    changes = True
+                    print(f"◄ Confirmed turn left {angle}°")
         
-        # Update position display
-        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
+        # Check for scan completions
+        if "IR scan complete" in self.buffer:
+            self.scan_data = self.parse_scan_data(self.buffer, "ir")
+            print(f"📊 Processed IR scan with {len(self.scan_data)} points")
+            changes = True
         
-        self.log(f"Moved forward {distance_cm} cm")
+        elif "PING scan complete" in self.buffer:
+            self.scan_data = self.parse_scan_data(self.buffer, "ping")
+            print(f"📊 Processed PING scan with {len(self.scan_data)} points")
+            changes = True
+        
+        # Check for object detection
+        if "Object Detection Results" in self.buffer:
+            if "IR Object Detection Results" in self.buffer:
+                self.objects = self.parse_objects(self.buffer)
+                print(f"🔍 Detected {len(self.objects)} objects with IR")
+                changes = True
+            
+            elif "PING Object Detection Results" in self.buffer:
+                self.objects = self.parse_objects(self.buffer)
+                print(f"🔍 Detected {len(self.objects)} objects with PING")
+                changes = True
+        
+        # If we've processed a complete response, reset the buffer
+        if ">" in self.buffer:
+            self.buffer = ""
+        
+        return changes
     
-    def turn_right(self, angle):
-        # Update angle (negative because right turn decreases angle)
-        self.cybot_position['angle'] -= angle
-        
-        # Normalize angle to 0-360
-        self.cybot_position['angle'] %= 360
-        
-        # Add to movement history
-        self.movement_history.append(dict(self.cybot_position))
-        
-        # Update map
-        self.update_map()
-        
-        # Update position display
-        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
-        
-        self.log(f"Turned right {angle} degrees")
-    
-    def turn_left(self, angle):
-        # Update angle (positive because left turn increases angle)
-        self.cybot_position['angle'] += angle
-        
-        # Normalize angle to 0-360
-        self.cybot_position['angle'] %= 360
-        
-        # Add to movement history
-        self.movement_history.append(dict(self.cybot_position))
-        
-        # Update map
-        self.update_map()
-        
-        # Update position display
-        self.position_var.set(f"({self.cybot_position['x']:.1f}, {self.cybot_position['y']:.1f}, {self.cybot_position['angle']}°)")
-        
-        self.log(f"Turned left {angle} degrees")
-    
-    def extract_number(self, text, pattern):
-        match = re.search(pattern, text)
-        if match:
-            try:
-                return float(match.group(1))
-            except:
-                return None
-        return None
-    
-    def log(self, message, color="black"):
-        if not self.show_log:
+    def run(self):
+        """Run the mapping application"""
+        if not self.connect():
+            print("Failed to connect. Exiting.")
             return
-            
-        # Add timestamp
-        timestamp = time.strftime("%H:%M:%S")
         
-        # Skip debug messages if debug mode is off
-        if color == "gray" and not self.debug_mode:
-            return
-            
-        full_message = f"[{timestamp}] {message}\n"
+        plt.ion()  # Interactive mode
+        plt.show()
         
-        # Update log in main thread
-        self.root.after(0, self._update_log, full_message, color)
-    
-    def _update_log(self, message, color):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, message)
-        
-        # Apply color to the last inserted line
-        last_line_start = self.log_text.index(f"end-{len(message)+1}c")
-        last_line_end = self.log_text.index("end-1c")
-        self.log_text.tag_add(color, last_line_start, last_line_end)
-        self.log_text.tag_config(color, foreground=color)
-        
-        self.log_text.see(tk.END)  # Scroll to the end
-        self.log_text.config(state=tk.DISABLED)
-    
-    def on_closing(self):
-        if self.connected:
-            self.disconnect()
-        self.root.destroy()
-
-
-class MovementDialog:
-    def __init__(self, parent, prompt):
-        self.result = None
-        
-        # Create dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Input Required")
-        self.dialog.geometry("300x120")
-        self.dialog.resizable(False, False)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-        
-        # Center on parent
-        x = parent.winfo_x() + parent.winfo_width() // 2 - 150
-        y = parent.winfo_y() + parent.winfo_height() // 2 - 60
-        self.dialog.geometry(f"+{x}+{y}")
-        
-        # Add prompt label
-        ttk.Label(self.dialog, text=prompt).pack(pady=(10, 5))
-        
-        # Add entry field
-        self.entry = ttk.Entry(self.dialog, width=10)
-        self.entry.pack(pady=5)
-        self.entry.focus_set()
-        
-        # Add buttons
-        button_frame = ttk.Frame(self.dialog)
-        button_frame.pack(pady=10)
-        
-        ttk.Button(button_frame, text="OK", command=self.on_ok).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=self.on_cancel).pack(side=tk.LEFT, padx=5)
-        
-        # Handle Enter key
-        self.dialog.bind("<Return>", lambda event: self.on_ok())
-        self.dialog.bind("<Escape>", lambda event: self.on_cancel())
-        
-        # Wait for dialog to close
-        self.dialog.wait_window()
-    
-    def on_ok(self):
         try:
-            self.result = float(self.entry.get())
-            self.dialog.destroy()
-        except ValueError:
-            tk.messagebox.showerror("Invalid Input", "Please enter a valid number")
-    
-    def on_cancel(self):
-        self.dialog.destroy()
+            print("\nCyBot Mapper running. Press Ctrl+C to exit.")
+            print("Available commands:")
+            print("  i - IR scan")
+            print("  p - PING scan")
+            print("  m - Move with parameters")
+            print("  f - Quick move forward 10cm")
+            print("  b - Quick move backward 10cm")
+            print("  r - Quick turn right 10°")
+            print("  l - Quick turn left 10°")
+            
+            while True:
+                # Non-blocking input method using modified input_available function
+                if check_for_input():
+                    cmd = input("\nEnter command: ")
+                    self.send_command(cmd)
+                
+                # Receive and process data
+                data = self.receive_data()
+                if data:
+                    if self.process_response(data):
+                        self.update_map()
+                        plt.draw()
+                
+                plt.pause(0.1)  # Allow plot to update
+                
+        except KeyboardInterrupt:
+            print("\nExiting...")
+        finally:
+            if self.socket:
+                self.socket.close()
+            plt.ioff()
 
+# Cross-platform input checking function
+def check_for_input():
+    """
+    Cross-platform implementation of non-blocking input check.
+    Returns True if input is available, False otherwise.
+    """
+    # Windows-specific implementation
+    if platform.system() == 'Windows':
+        # Use msvcrt for Windows
+        try:
+            import msvcrt
+            return msvcrt.kbhit()
+        except ImportError:
+            # Fall back to polling method if msvcrt not available
+            return False
+    else:
+        # Unix/Linux/Mac implementation
+        import select
+        # Use select for checking stdin on non-Windows platforms
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0)
+            return bool(ready)
+        except:
+            # Fall back to returning False if select fails
+            return False
+
+# Thread-safe user input function
+def get_user_input(prompt=""):
+    """Get user input in a thread-safe way"""
+    if prompt:
+        print(prompt, end='', flush=True)
+    return input()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = CybotControlApp(root)
-    root.mainloop()
+    mapper = CyBotMapper(host="192.168.1.1", port=288)
+    mapper.run()
